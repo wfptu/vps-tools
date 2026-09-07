@@ -1,129 +1,127 @@
 #!/bin/bash
 
-# Oracle VPS 专家级自动巡检与加固交互脚本
-# 支持：资源监控、Swap加固、交互式木马清理、SSH端口修改
+# Oracle VPS 专家级安全巡检交互脚本 v2.0
+# 修复了交互逻辑，支持逐个清理恶意任务与篡改文件
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 echo -e "${BLUE}====================================================${NC}"
-echo -e "${BLUE}        Oracle VPS 专家级安全巡检交互脚本            ${NC}"
+echo -e "${BLUE}        Oracle VPS 专家级安全巡检脚本 v2.0          ${NC}"
 echo -e "${BLUE}====================================================${NC}"
 
-# 1. 检查 root 权限
 if [ "$EUID" -ne 0 ]; then 
     echo -e "${RED}请以 root 用户运行此脚本！${NC}"
     exit 1
 fi
 
-# 2. 资源状态检查
-echo -e "\n${YELLOW}[1. 系统资源状态预览]${NC}"
-UPTIME=$(uptime -p)
-LOAD=$(uptime | awk -F'load average:' '{ print $2 }')
-MEM_FREE=$(free -m | awk '/Mem:/ { print $4 }')
-DISK_USAGE=$(df -h / | awk 'NR==2 {print $5}')
-echo -e "运行时间: $UPTIME"
-echo -e "负载情况: $LOAD"
-echo -e "剩余内存: ${MEM_FREE}MB"
-echo -e "磁盘占用: $DISK_USAGE"
-
-# 3. Swap 交互检查
-echo -e "\n${YELLOW}[2. 虚拟内存 (Swap) 检查]${NC}"
+# --- [1. Swap 检查] ---
+echo -e "\n${YELLOW}[1. 虚拟内存 (Swap) 检查]${NC}"
 SWAP_TOTAL=$(free -m | awk '/Swap:/ { print $2 }')
 if [ "$SWAP_TOTAL" -eq 0 ]; then
-    echo -e "${RED}警告: 当前未开启 Swap，小内存机型极易死机！${NC}"
-    read -p "是否立即创建 2GB 虚拟内存? (y/n): " choice
-    if [[ "$choice" == "y" ]]; then
+    read -p "未开启 Swap，容易导致 SSH 死机。是否创建 2GB Swap? (y/n): " swp_c
+    if [[ "$swp_c" == "y" ]]; then
         fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
         echo '/swapfile none swap sw 0 0' >> /etc/fstab
-        echo -e "${GREEN}Swap 创建成功！${NC}"
+        echo -e "${GREEN}Swap 已开启。${NC}"
     fi
 else
-    echo -e "${GREEN}Swap 已开启，当前容量: ${SWAP_TOTAL}MB${NC}"
+    echo -e "${GREEN}Swap 已开启 ($SWAP_TOTAL MB)。${NC}"
 fi
 
-# 4. 交互式定时任务(木马)扫描
-echo -e "\n${YELLOW}[3. 恶意定时任务扫描]${NC}"
-# 常见木马关键词
-KEYWORDS="perfcc|http|curl|wget|miner|cryptonight"
-SUSPICIOUS=$(grep -rE "$KEYWORDS" /etc/cron* /var/spool/cron/crontabs 2>/dev/null)
+# --- [2. 恶意定时任务清理] ---
+echo -e "\n${YELLOW}[2. 恶意定时任务清理]${NC}"
+KEYWORDS="perfcc|perfclean|miner|cryptonight|root/.config"
+# 使用 grep -l 只列出文件名，并存入数组
+SUS_FILES=$(grep -rlE "$KEYWORDS" /etc/cron* /var/spool/cron/crontabs 2>/dev/null)
 
-if [ -n "$SUSPICIOUS" ]; then
-    echo -e "${RED}发现可疑定时任务记录:${NC}"
-    echo "$SUSPICIOUS" | while read -r line; do
-        FILE=$(echo "$line" | cut -d: -f1)
-        CONTENT=$(echo "$line" | cut -d: -f2-)
-        echo -e "\n待处理文件: ${BLUE}$FILE${NC}"
-        echo -e "内容: $CONTENT"
-        read -p "是否删除该文件/记录? (y/n): " del_choice
-        if [[ "$del_choice" == "y" ]]; then
-            if [[ "$FILE" == *"crontabs/root"* ]]; then
-                echo -e "${YELLOW}正在尝试清理 root crontab 中的恶意行...${NC}"
-                # 精确删除包含关键字的行
+if [ -z "$SUS_FILES" ]; then
+    echo -e "${GREEN}未发现明显的恶意定时任务。${NC}"
+else
+    echo -e "${RED}警告：发现以下可疑定时任务文件！${NC}"
+    for f in $SUS_FILES; do
+        echo -e "--------------------------------------"
+        echo -e "文件: ${BLUE}$f${NC}"
+        echo -e "内容预览: $(grep -E "$KEYWORDS" "$f" | head -n1)"
+        read -p "是否删除此任务? (y/n): " cfm
+        if [[ "$cfm" == "y" ]]; then
+            if [[ "$f" == *"crontabs/root" ]]; then
+                # 如果是 root 的主 crontab，只清理恶意行
                 (crontab -l | grep -vE "$KEYWORDS") | crontab -
+                echo -e "${GREEN}已清理 root 任务中的恶意记录。${NC}"
             else
-                rm -f "$FILE"
-                echo -e "${GREEN}文件 $FILE 已删除${NC}"
+                rm -f "$f"
+                echo -e "${GREEN}已删除文件: $f${NC}"
             fi
         fi
     done
-else
-    echo -e "${GREEN}未发现明显的恶意定时任务。${NC}"
 fi
 
-# 5. 系统关键命令完整性检查
-echo -e "\n${YELLOW}[4. 系统命令篡改检查]${NC}"
-# 检查最近 7 天内被修改过的系统命令
-ALTERED=$(find /bin /usr/bin -mtime -7 -type f)
-if [ -n "$ALTERED" ]; then
-    echo -e "${RED}警告: 以下核心命令在最近 7 天内被修改过，可能已被植入后门:${NC}"
-    echo "$ALTERED"
+# --- [3. 系统目录篡改检查与清理] ---
+echo -e "\n${YELLOW}[3. 系统关键目录篡改检查]${NC}"
+echo -e "正在扫描 /bin /usr/bin 最近 7 天变动的文件..."
+# 排除一些常见的正常变动文件
+ALTERED=$(find /bin /sbin /usr/bin /usr/sbin -mtime -7 -type f 2>/dev/null)
+
+if [ -z "$ALTERED" ]; then
+    echo -e "${GREEN}未发现最近篡改的文件。${NC}"
 else
-    echo -e "${GREEN}核心系统命令日期正常。${NC}"
-fi
-
-# 6. 交互式 SSH 端口修改
-echo -e "\n${YELLOW}[5. SSH 安全策略调整]${NC}"
-CURRENT_PORT=$(grep "Port " /etc/ssh/sshd_config | awk '{print $2}' | head -n1)
-[ -z "$CURRENT_PORT" ] && CURRENT_PORT=22
-echo -e "当前 SSH 端口: ${BLUE}$CURRENT_PORT${NC}"
-
-read -p "是否需要修改 SSH 端口? (y/n): " port_choice
-if [[ "$port_choice" == "y" ]]; then
-    read -p "请输入新的端口号 (建议 10000-65535): " NEW_PORT
-    if [[ "$NEW_PORT" =~ ^[0-9]+$ ]]; then
-        sed -i "s/^#Port .*/Port $NEW_PORT/" /etc/ssh/sshd_config
-        sed -i "s/^Port .*/Port $NEW_PORT/" /etc/ssh/sshd_config
-        echo -e "${GREEN}端口已配置为 $NEW_PORT。${NC}"
-        echo -e "${RED}注意：请务必在甲骨文后台安全列表开放 TCP $NEW_PORT 端口后再重启 SSH！${NC}"
-        read -p "现在重启 SSH 服务吗? (y/n): " restart_ssh
-        if [[ "$restart_ssh" == "y" ]]; then
-            systemctl restart ssh
-            echo -e "${GREEN}SSH 服务已重启。${NC}"
+    echo -e "${RED}发现以下最近变动的文件（极度可疑）：${NC}"
+    for f in $ALTERED; do
+        # 排除掉 x-ui，避免误删
+        if [[ "$f" == *"x-ui"* ]]; then
+            echo -e "${YELLOW}[忽略]${NC} 正常服务文件: $f"
+            continue
         fi
-    else
-        echo -e "${RED}输入无效，取消修改。${NC}"
+
+        echo -e "--------------------------------------"
+        echo -e "可疑文件: ${RED}$f${NC}"
+        read -p "是否彻底删除此文件? (y/n): " fcfm
+        if [[ "$fcfm" == "y" ]]; then
+            rm -f "$f"
+            echo -e "${GREEN}已删除文件: $f${NC}"
+        fi
+    done
+fi
+
+# 特别检查本次发现的 wbin 恶意文件夹
+if [ -d "/usr/bin/wbin" ]; then
+    echo -e "\n${RED}检测到恶意文件夹 /usr/bin/wbin (通常是木马存放处)${NC}"
+    read -p "是否递归删除整个 /usr/bin/wbin 文件夹? (y/n): " dwbin
+    if [[ "$dwbin" == "y" ]]; then
+        rm -rf /usr/bin/wbin
+        echo -e "${GREEN}已清理恶意文件夹。${NC}"
     fi
 fi
 
-# 7. SSH 免密登录后门检查
-echo -e "\n${YELLOW}[6. SSH 后门钥匙检查]${NC}"
-AUTH_FILE="/root/.ssh/authorized_keys"
-if [ -f "$AUTH_FILE" ]; then
-    echo -e "当前已有的 SSH 公钥:"
-    cat -n "$AUTH_FILE"
-    read -p "是否清空所有已授权的公钥? (y/n): " clear_ssh
-    if [[ "$clear_ssh" == "y" ]]; then
-        > "$AUTH_FILE"
-        echo -e "${GREEN}公钥已清空。${NC}"
-    fi
-else
-    echo -e "${GREEN}未发现 SSH 公钥文件。${NC}"
+# --- [4. SSH 端口修改] ---
+echo -e "\n${YELLOW}[4. SSH 端口加固]${NC}"
+CUR_PORT=$(grep "Port " /etc/ssh/sshd_config | awk '{print $2}' | head -n1)
+: ${CUR_PORT:=22}
+echo -e "当前 SSH 端口: ${BLUE}$CUR_PORT${NC}"
+read -p "是否修改端口以躲避扫描? (y/n): " p_c
+if [[ "$p_c" == "y" ]]; then
+    read -p "输入新端口 (10000-65535): " NEW_P
+    sed -i "s/^#Port .*/Port $NEW_P/" /etc/ssh/sshd_config
+    sed -i "s/^Port .*/Port $NEW_P/" /etc/ssh/sshd_config
+    echo -e "${RED}请确认甲骨文后台已放行 $NEW_P 端口！${NC}"
+    read -p "是否现在重启 SSH 服务? (y/n): " r_s
+    [[ "$r_s" == "y" ]] && systemctl restart ssh && echo -e "${GREEN}SSH 已重启。${NC}"
+fi
+
+# --- [5. SSH 公钥检查] ---
+echo -e "\n${YELLOW}[5. SSH 后门公钥检查]${NC}"
+AK="/root/.ssh/authorized_keys"
+if [ -f "$AK" ]; then
+    echo -e "当前公钥列表:"
+    cat -n "$AK"
+    read -p "是否清空公钥(防止黑客留后门)? (y/n): " c_ak
+    [[ "$c_ak" == "y" ]] && > "$AK" && echo -e "${GREEN}公钥已清空。${NC}"
 fi
 
 echo -e "\n${BLUE}====================================================${NC}"
-echo -e "${GREEN}巡检完成！建议定期运行此脚本。${NC}"
+echo -e "${GREEN}巡检完成！${NC}"
 echo -e "${BLUE}====================================================${NC}"
