@@ -1,66 +1,42 @@
 #!/bin/bash
 
-# Oracle VPS 木马粉碎脚本 v3.0 (增强挂载清理版)
-# 针对目标: /usr/bin/wbin
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
+# Oracle VPS 木马粉碎脚本 v4.0 (内核级清理版)
 TARGET="/usr/bin/wbin"
 
-echo -e "${YELLOW}开始执行 [高级别] 强力粉碎任务...${NC}"
+echo "正在执行最后的一线生机：深度内核级清理..."
 
-if [ "$EUID" -ne 0 ]; then 
-    echo -e "${RED}错误: 必须以 root 运行！${NC}"
-    exit 1
+# 1. 强力停掉可能被寄生的服务
+systemctl stop docker containerd snapd 2>/dev/null
+
+# 2. 暴力清理网络命名空间 (这是导致 Device busy 的主因)
+echo "清理网络命名空间..."
+if command -v ip >/dev/null 2>&1; then
+    for ns in $(ip netns list | awk '{print $1}'); do
+        ip netns delete "$ns" 2>/dev/null
+    done
 fi
 
-# 1. 停止定时任务
-systemctl stop cron 2>/dev/null
-systemctl stop crond 2>/dev/null
+# 3. 找出所有正在占用 wbin 的进程并直接从内核层面杀死
+echo "暴力清除占用进程..."
+lsof | grep "$TARGET" | awk '{print $2}' | sort -u | xargs -r kill -9 2>/dev/null
 
-# 2. 核心步骤：强制卸载挂载点 (解决 Device or resource busy)
-echo -e "${YELLOW}正在清理内核挂载点 (Unmounting)...${NC}"
-# 查找所有与 wbin 相关的挂载点并按倒序排列（先卸载子目录）
-grep "$TARGET" /proc/mounts | awk '{print $2}' | sort -r | while read -r mount_point; do
-    echo -e "正在卸载: $mount_point"
-    umount -f -l "$mount_point" 2>/dev/null
+# 4. 强制卸载挂载点（使用更底层的 mountinfo 扫描）
+echo "从内核底层剥离挂载点..."
+tac /proc/self/mountinfo | grep "$TARGET" | awk '{print $5}' | while read -r mnt; do
+    echo "强制卸载: $mnt"
+    umount -f -l "$mnt" 2>/dev/null
 done
 
-# 3. 清理网络命名空间 (netns)
-echo -e "${YELLOW}正在清理网络命名空间...${NC}"
-if [ -d "$TARGET/exec/netns" ]; then
-    find "$TARGET/exec/netns" -type f | xargs -I {} umount -f -l {} 2>/dev/null
-fi
-
-# 4. 暴力杀掉残留进程
-echo -e "${YELLOW}正在杀掉占用目录的残留进程...${NC}"
-lsof "$TARGET" 2>/dev/null | awk 'NR>1 {print $2}' | xargs kill -9 2>/dev/null
-ps -ef | grep "$TARGET" | grep -v grep | awk '{print $2}' | xargs kill -9 2>/dev/null
-
-# 5. 解除文件锁定属性
-echo -e "${YELLOW}正在解除文件锁定...${NC}"
+# 5. 尝试解除锁定并彻底删除
+echo "尝试执行最终删除..."
 chattr -R -i "$TARGET" 2>/dev/null
 chattr -R -a "$TARGET" 2>/dev/null
-
-# 6. 再次尝试删除
-echo -e "${YELLOW}正在执行最终粉碎...${NC}"
 rm -rf "$TARGET"
 
-# 7. 检查结果
+# 6. 最后的验证
 if [ ! -d "$TARGET" ]; then
-    echo -e "${GREEN}--------------------------------------${NC}"
-    echo -e "${GREEN}成功：$TARGET 已被彻底粉碎并卸载！${NC}"
-    echo -e "${GREEN}--------------------------------------${NC}"
+    echo "！！！成功：$TARGET 已被铲除！！！"
+    echo "请立即重启服务器：reboot"
 else
-    echo -e "${RED}--------------------------------------${NC}"
-    echo -e "${RED}严重警告：即便卸载了挂载点，删除依然失败。${NC}"
-    echo -e "${RED}这说明该木马极可能加载了内核模块 (Rootkit)。${NC}"
-    echo -e "${RED}为了您的数据安全，请务必【重装系统】。${NC}"
-    echo -e "${RED}--------------------------------------${NC}"
+    echo "！！！严重警告：清理失败！！！"
 fi
-
-# 恢复 Cron
-systemctl start cron 2>/dev/null
