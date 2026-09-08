@@ -3,7 +3,7 @@
 # Oracle VPS 木马粉碎脚本 v4.0 (内核级清理版)
 TARGET="/usr/bin/wbin"
 
-echo "正在执行最后的一线生机：深度内核级清理..."
+echo "正在执行深度内核级清理..."
 
 # 1. 强力停掉可能被寄生的服务
 systemctl stop docker containerd snapd 2>/dev/null
