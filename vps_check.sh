@@ -7,7 +7,7 @@
 set -u
 umask 077
 
-VERSION="4.0"
+VERSION="4.1"
 BACKUP_DIR="/root/vps_security_backup_$(date +%Y%m%d_%H%M%S)"
 REPORT="/root/vps_health_$(date +%Y%m%d_%H%M%S).log"
 mkdir -p "$BACKUP_DIR"
@@ -224,8 +224,142 @@ run_health_check() {
   check_suid
   check_recent_exec
   check_logs
+  check_bbr_chrony
   log "\n${GREEN}巡检完成。报告：$REPORT${NC}"
   log "备份目录：$BACKUP_DIR"
+}
+
+
+# ---------- Oracle baseline / performance operations ----------
+
+install_base_tools() {
+  log "\n${BLUE}=== 安装常用基础工具 ===${NC}"
+  local pm
+  pm=$(pkg_manager)
+
+  case "$pm" in
+    apt)
+      apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        curl wget socat chrony htop unzip net-tools ca-certificates
+      ;;
+    dnf)
+      dnf install -y curl wget socat chrony htop unzip net-tools ca-certificates
+      ;;
+    yum)
+      yum install -y curl wget socat chrony htop unzip net-tools ca-certificates
+      ;;
+    *)
+      bad "无法识别包管理器"; return 1 ;;
+  esac
+
+  ok "基础工具安装完成"
+}
+
+configure_chrony() {
+  log "\n${BLUE}=== Chrony 时间同步 ===${NC}"
+  local service=""
+  if systemctl list-unit-files 2>/dev/null | grep -q '^chronyd\.service'; then
+    service="chronyd"
+  elif systemctl list-unit-files 2>/dev/null | grep -q '^chrony\.service'; then
+    service="chrony"
+  fi
+
+  if [[ -z "$service" ]]; then
+    install_base_tools || return 1
+    if systemctl list-unit-files 2>/dev/null | grep -q '^chronyd\.service'; then
+      service="chronyd"
+    else
+      service="chrony"
+    fi
+  fi
+
+  systemctl enable --now "$service" 2>/dev/null || {
+    bad "无法启动 $service"
+    return 1
+  }
+
+  if command -v chronyc >/dev/null 2>&1; then
+    chronyc tracking 2>/dev/null | tee -a "$REPORT" || true
+    chronyc sources -v 2>/dev/null | head -20 | tee -a "$REPORT" || true
+  fi
+  ok "Chrony 已启用并启动"
+}
+
+configure_bbr() {
+  log "\n${BLUE}=== BBR 网络拥塞控制 ===${NC}"
+
+  local available current
+  available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+  current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+
+  info "可用拥塞控制：${available:-未知}"
+  info "当前拥塞控制：${current:-未知}"
+
+  # 新版 Debian/Oracle Linux 的 BBR 通常已经由内核提供。
+  # 不强制替换内核；仅在模块存在时尝试加载。
+  if ! grep -qw bbr <<<"$available"; then
+    modprobe tcp_bbr 2>/dev/null || true
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+  fi
+
+  if ! grep -qw bbr <<<"$available"; then
+    warn "当前内核未提供 BBR，跳过配置，不强行安装/替换内核。"
+    return 0
+  fi
+
+  mkdir -p /etc/modules-load.d /etc/sysctl.d
+
+  if modinfo tcp_bbr >/dev/null 2>&1; then
+    cat > /etc/modules-load.d/bbr.conf <<'EOF'
+tcp_bbr
+EOF
+  fi
+
+  cat > /etc/sysctl.d/99-bbr.conf <<'EOF'
+# Managed by vps_check.sh
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+
+  sysctl --system >/dev/null 2>&1 || true
+
+  current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+  if [[ "$current" == "bbr" ]]; then
+    ok "BBR 已启用：$current"
+  else
+    warn "BBR 配置文件已写入，但当前状态为：${current:-未知}"
+  fi
+}
+
+system_baseline() {
+  log "\n${BLUE}=== Oracle VPS 基础环境初始化 ===${NC}"
+  install_base_tools || return 1
+  configure_chrony || true
+  configure_bbr || true
+  system_update
+  log "\n${GREEN}基础初始化完成。建议重新运行「完整健康巡检」。${NC}"
+}
+
+check_bbr_chrony() {
+  log "\n${BLUE}=== 11. BBR / 时间同步状态 ===${NC}"
+  local cc
+  cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+  local avail
+  avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+  log "BBR available: ${avail:-unknown}"
+  log "Current congestion control: ${cc:-unknown}"
+  if [[ "$cc" == "bbr" ]]; then
+    ok "BBR 当前生效"
+  else
+    warn "BBR 当前未生效（不一定是问题，取决于内核/用途）"
+  fi
+
+  if command -v chronyc >/dev/null 2>&1; then
+    chronyc tracking 2>/dev/null | tee -a "$REPORT" || true
+  else
+    warn "未安装 chronyc"
+  fi
 }
 
 # ---------- Security operations ----------
@@ -408,6 +542,7 @@ menu() {
     echo " 7. 系统更新"
     echo " 8. 人工确认后清理高风险文件"
     echo " 9. 查看最近一次报告"
+    echo "10. Oracle VPS 基础初始化（工具/Chrony/BBR/更新)"
     echo " 0. 退出"
     echo "----------------------------------------------"
     read -rp "请选择 [0-9]: " choice
