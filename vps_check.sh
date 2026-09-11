@@ -1,148 +1,127 @@
 #!/usr/bin/env bash
-# oracle_vps_guard.sh v5.0
-# Oracle VPS health/security toolkit
+# oracle_vps_guard_v5.1
+# Bilingual Oracle VPS Security Toolkit
 
-VERSION="5.0"
+VERSION="5.1"
 REPORT="/root/oracle_vps_guard_$(date +%Y%m%d_%H%M%S).log"
-BACKUP="/root/oracle_guard_backup_$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$BACKUP"
-
-GREEN="\033[32m"; RED="\033[31m"; YELLOW="\033[33m"; NC="\033[0m"
 
 log(){ echo -e "$*" | tee -a "$REPORT"; }
-ok(){ log "${GREEN}[OK]${NC} $*"; }
-warn(){ log "${YELLOW}[WARN]${NC} $*"; }
-high(){ log "${RED}[HIGH]${NC} $*"; }
 
-pkg(){
- command -v apt-get >/dev/null && echo apt && return
- command -v dnf >/dev/null && echo dnf && return
- command -v yum >/dev/null && echo yum && return
- echo none
-}
-
-full_check(){
- log "===== SYSTEM ====="
+audit(){
+ log "===== Oracle VPS Audit / 安全巡检 ====="
  cat /etc/os-release 2>/dev/null | grep PRETTY_NAME
  uname -a
  uptime
  df -h /
-
- log "===== PROCESS ====="
  ps aux --sort=-%cpu | head -20
 
- log "===== CRON ANALYSIS ====="
+ log "===== Cron / 定时任务 ====="
  for f in /etc/crontab /var/spool/cron/crontabs/root /var/spool/cron/root; do
-   [ -f "$f" ] || continue
-   log "--- $f ---"
-   cat "$f"
-   if grep -Ei "curl|wget|base64|/tmp/|/dev/shm/|nc |socat" "$f" >/dev/null; then
-      grep -Ei "curl|wget|base64|/tmp/|/dev/shm/|nc |socat" "$f" | grep -Eiv "x-ui|3x-ui|acme.sh|certbot|docker" | while read l; do
-          high "Suspicious cron: $l"
-      done
-   fi
+  [ -f "$f" ] || continue
+  cat "$f"
+  grep -Ei "curl|wget|base64|/tmp/|/dev/shm/|nc |socat" "$f" 2>/dev/null |
+  grep -Eiv "x-ui|3x-ui|acme.sh|certbot|docker" &&
+  log "[HIGH] Suspicious cron / 可疑任务"
  done
 
- log "===== SYSTEMD ====="
- grep -RHE "curl|wget|base64|/tmp/|/dev/shm/" /etc/systemd/system 2>/dev/null | head -50
-
- log "===== SSH ====="
- sshd -T 2>/dev/null | grep -E "port|passwordauthentication|permitrootlogin"
-
- log "===== NETWORK ====="
+ log "===== SSH / 网络 ====="
+ sshd -T 2>/dev/null | grep port
  ss -lntup
 
- log "===== SECURITY ====="
- [ -f /etc/ld.so.preload ] && cat /etc/ld.so.preload
- awk -F: '$3==0{print $1}' /etc/passwd
-
- log "===== BBR ====="
- sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null
- sysctl net.ipv4.tcp_congestion_control 2>/dev/null
+ [ -e /usr/bin/wbin ] && log "[HIGH] IOC /usr/bin/wbin"
 
  log "Report: $REPORT"
 }
 
-install_tools(){
- case "$(pkg)" in
- apt)
-  apt update
-  apt install -y curl wget socat chrony htop unzip ca-certificates net-tools fail2ban
- ;;
- dnf|yum)
-  $(pkg) install -y curl wget socat chrony htop unzip ca-certificates net-tools fail2ban
- ;;
- esac
-}
+ssh_port(){
+ read -rp "New SSH port / 新SSH端口: " p
+ mkdir -p /etc/ssh/sshd_config.d
+ cp /etc/ssh/sshd_config /root/sshd_config.backup 2>/dev/null || true
 
-enable_bbr(){
- modprobe tcp_bbr 2>/dev/null || true
- cat >/etc/sysctl.d/99-bbr.conf <<EOF
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
- sysctl --system
-}
+ sed -ri 's/^Port /#OldPort /' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true
 
-enable_chrony(){
- systemctl enable --now chrony 2>/dev/null || systemctl enable --now chronyd 2>/dev/null
-}
+ echo "Port $p" >/etc/ssh/sshd_config.d/99-custom-port.conf
 
-cleanup_wbin(){
- if [ -e /usr/bin/wbin ]; then
-  high "Found /usr/bin/wbin"
-  file /usr/bin/wbin
-  stat /usr/bin/wbin
-  read -rp "Delete? type DELETE: " c
-  [ "$c" = DELETE ] && rm -f /usr/bin/wbin
+ if sshd -t; then
+  systemctl restart sshd 2>/dev/null || systemctl restart ssh
+  echo "New port configured / 新端口已配置: $p"
+  echo "Test new SSH before logout / 退出前测试新连接"
  else
-  ok "/usr/bin/wbin not found"
+  echo "SSH config error / SSH配置错误"
  fi
 }
 
-change_port(){
- read -rp "New SSH port: " p
+disable22(){
+ echo "WARNING: Closing port 22 may lock you out."
+ read -rp "Type YES to continue: " c
+ [ "$c" = YES ] || return
+
  mkdir -p /etc/ssh/sshd_config.d
- cp /etc/ssh/sshd_config "$BACKUP/" 2>/dev/null || true
- echo "Port $p" >/etc/ssh/sshd_config.d/99-custom-port.conf
- sshd -t && (systemctl restart sshd || systemctl restart ssh)
+ echo "# Port 22 disabled after migration" >/etc/ssh/sshd_config.d/100-disable22.conf
+
+ systemctl restart sshd 2>/dev/null || systemctl restart ssh
+
+ echo "Remove TCP22 from OCI Security List/NSG too."
+}
+
+dd_backup(){
+ mkdir -p /root/oracle_guard_backup
+ tar czf /root/oracle_guard_backup/config_backup.tar.gz  /etc/ssh /etc/x-ui /usr/local/x-ui /root 2>/dev/null || true
+ crontab -l >/root/oracle_guard_backup/root_cron.txt 2>/dev/null || true
+ ip addr >/root/oracle_guard_backup/network.txt
+ echo "Backup completed / 备份完成"
+}
+
+install_tools(){
+ apt update 2>/dev/null || true
+ apt install -y curl wget socat chrony htop unzip ca-certificates net-tools fail2ban 2>/dev/null || true
+ dnf install -y curl wget socat chrony htop unzip ca-certificates net-tools fail2ban 2>/dev/null || true
+}
+
+secure_mode(){
+ echo "Risk: SSH changes may disconnect you."
+ read -rp "Continue YES: " c
+ [ "$c" = YES ] || return
+
+ mkdir -p /etc/ssh/sshd_config.d
+ cat >/etc/ssh/sshd_config.d/98-hardening.conf <<EOF
+PasswordAuthentication no
+PermitEmptyPasswords no
+MaxAuthTries 5
+EOF
+
+ systemctl restart sshd 2>/dev/null || systemctl restart ssh
 }
 
 menu(){
- while true; do
- cat <<EOF
+while true; do
+cat <<EOF
 
 Oracle VPS Guard v$VERSION
 
-1. Full security check
-2. Install tools + fail2ban
-3. Enable Chrony
-4. Enable BBR
-5. Update system
-6. Change root password
-7. Change SSH port
-8. Cleanup /usr/bin/wbin
-9. View latest report
-0. Exit
+1 Audit / 巡检
+2 Secure mode / 安全基线
+3 Change SSH port / 修改SSH端口
+4 Disable SSH 22 / 关闭22端口
+5 Install tools+Fail2ban / 安装工具
+6 DD backup / 重装备份
+0 Exit / 退出
+
 EOF
 
- read -rp "Select [0-9]: " n
- case $n in
- 1) full_check;;
- 2) install_tools;;
- 3) enable_chrony;;
- 4) enable_bbr;;
- 5) apt update && apt upgrade -y 2>/dev/null || true;;
- 6) passwd root;;
- 7) change_port;;
- 8) cleanup_wbin;;
- 9) less $(ls -t /root/oracle_vps_guard_*.log 2>/dev/null | head -1);;
- 0) exit;;
- *) echo invalid;;
- esac
- done
+read -rp "Select / 选择: " n
+case $n in
+1)audit;;
+2)secure_mode;;
+3)ssh_port;;
+4)disable22;;
+5)install_tools;;
+6)dd_backup;;
+0)exit;;
+*)echo Invalid;;
+esac
+done
 }
 
-[ "$EUID" = 0 ] || { echo "Run as root"; exit 1; }
-
+[ "$EUID" = 0 ] || exit 1
 menu
